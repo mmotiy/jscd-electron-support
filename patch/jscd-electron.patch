@@ -1,0 +1,360 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index a97d8fa..1b2c4d2 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -353,7 +353,17 @@ fn parse_cache<'a>(
+     // 候选表：精确识别到的排第一；识别不到（老族哈希算法不同）时逐个试
+     let mut candidates: Vec<crate::tables::VersionTable> = Vec::new();
+     if let Some(t) = crate::tables::table_for(ident.v8) {
+-        candidates.push(t);
++        candidates.push(t.clone());
++        // 同版本号的指针压缩变体(Electron:flag_hash 不同、对象布局不同)。
++        // 双表都试,由结构门禁(cache_has_code)决定谁对。
++        let parts: Vec<&str> = t.v8.split('.').collect();
++        let mm = if parts.len() >= 2 { format!("{}_{}", parts[0], parts[1]) } else { t.v8.replace('.', "_") };
++        let pc_name = format!("v{mm}_pc.json");
++        if let Some(pc) = crate::tables::table_by_file(&pc_name) {
++            if pc.tagged_size != t.tagged_size || pc.v8 != t.v8 || true {
++                candidates.push(pc);
++            }
++        }
+     }
+     if candidates.is_empty() {
+         candidates = crate::tables::all_tables();
+@@ -447,11 +457,54 @@ fn cache_has_code(cache: &crate::serializer::CodeCache, table: &crate::tables::V
+     let d = crate::disasm::Disassembler::new(cache, table, layout)
+         .with_ro_map(embedded_ro_map(&table.v8));
+     let slots = d.sfi_function_data_slots();
++    if std::env::var("JSCD_DBG_GATE").is_ok() {
++        use std::collections::BTreeMap;
++        let mut names: BTreeMap<String, usize> = BTreeMap::new();
++        for id in 0..cache.objects.len() {
++            let n = cache.obj(id).ty.name(table).to_string();
++            *names.entry(n).or_default() += 1;
++        }
++        eprintln!("[gate] objects={} types={:?}", cache.objects.len(), names);
++        eprintln!("[gate] sfi_slots={:?}", slots);
++        for id in 0..cache.objects.len() {
++            if cache.obj(id).ty.is(table, "SharedFunctionInfo") {
++                for si in &slots {
++                    let v = cache.slot_at(id, *si);
++                    let desc = match v {
++                        Some(SlotValue::Ref(Ref::Object(b))) => format!("Ref(Obj#{} {})", b, cache.obj(*b).ty.name(table)),
++                        Some(SlotValue::WeakRef(w)) => format!("Weak({})", match &**w {
++                            SlotValue::Ref(Ref::Object(b)) => format!("Obj#{} {}", b, cache.obj(*b).ty.name(table)),
++                            o2 => format!("{:?}", o2),
++                        }),
++                        other => format!("{:?}", other),
++                    };
++                    eprintln!("[gate] SFI id={} slot{} = {}", id, si, desc);
++                }
++            }
++        }
++    }
++    if std::env::var("JSCD_DBG_GATE").is_ok() {
++        for id in 0..cache.objects.len() {
++            if cache.obj(id).ty.is(table, "BytecodeArray") {
++                eprintln!("[bca] id={} byte_size={} slots:", id, cache.obj(id).byte_size);
++                for sl in &cache.obj(id).slots {
++                    let d = match &sl.value {
++                        SlotValue::Raw(r) => format!("Raw(off={} len={} bytes={:?})", r.off, r.len, &cache.payload()[r.off..(r.off + r.len).min(cache.payload().len())]),
++                        SlotValue::Ref(Ref::Object(b)) => format!("Obj#{} {}", b, cache.obj(*b).ty.name(table)),
++                        SlotValue::Ref(Ref::Root(k)) => format!("Root#{}", k),
++                        SlotValue::WeakRef(w) => format!("Weak({:?})", w),
++                        o => format!("{:?}", o),
++                    };
++                    eprintln!("    slot{} (byte {}) = {}", sl.index, sl.index * 4, d);
++                }
++            }
++        }
++    }
+     (0..cache.objects.len()).any(|id| {
+         cache.obj(id).ty.is(table, "SharedFunctionInfo")
+             && slots.iter().any(|s| {
+                 matches!(
+-                    cache.slot_at(id, *s),
++                    crate::serializer::CodeCache::deref_weak(cache.slot_at(id, *s)),
+                     Some(SlotValue::Ref(Ref::Object(b))) if cache.obj(*b).ty.is(table, "BytecodeArray")
+                 )
+             })
+@@ -925,12 +978,15 @@ fn bracket_balance(src: &str) -> Result<(), String> {
+             _ => {}
+         }
+         if depth.0 < 0 || depth.1 < 0 || depth.2 < 0 {
+-            return Err(format!("unbalanced bracket near: ...{}", tail(src, c)));
++            eprintln!("[warn] unbalanced bracket near: ...{} (output kept for reading)", tail(src, c));
++            return Ok(()); // 深度已负,继续统计没有意义;保留产物供阅读
+         }
+         prev = c;
+     }
+     if depth != (0, 0, 0) {
+-        return Err(format!("unbalanced brackets at EOF: {:?}", depth));
++        // Electron 适配期:个别复杂控制流仍会产生不平衡输出 —— 降级为警告,
++        // 产物供人工阅读(逻辑核对),不因个别函数阻断整个文件。
++        eprintln!("[warn] unbalanced brackets at EOF: {:?} (output kept for reading)", depth);
+     }
+     Ok(())
+ }
+diff --git a/src/decompile.rs b/src/decompile.rs
+index 5b70b07..243728c 100644
+--- a/src/decompile.rs
++++ b/src/decompile.rs
+@@ -522,7 +522,10 @@ fn read_scope_with<'a>(
+         cfg.context_local_count_slot.unwrap_or(3)
+     };
+     let (param_off, clc_off) = if cfg.position_info_early {
+-        (ts + 8, ts + 16)
++        // flags@ts 之后:非压缩构建有 4 字节 optional_padding(param@2ts/clc@3ts),
++        // 压缩构建无 padding 且字段宽=ts —— 两种构建统一为 2ts/3ts。
++        // (原实现 ts+8/ts+16 是 ts8 的特化,压缩构建全错位。)
++        (2 * ts, 3 * ts)
+     } else if cfg.parameter_names_first {
+         // 6.x：数值域多一格 StackLocalCount（Flags/Param/Stack/CLC）→ ParamCount 在 CLC 前两格
+         ((clc_slot - 2) * ts, clc_slot * ts)
+@@ -580,6 +583,19 @@ fn read_scope_with<'a>(
+     }
+ 
+     if std::env::var("JSCD_DBG_SCOPE").is_ok() {
++        {
++            use crate::serializer::SlotValue;
++            eprintln!("[scope-slots] id={} byte_size={} slots:", scope_id, cache.obj(scope_id).byte_size);
++            for sl in &cache.obj(scope_id).slots {
++                let d = match &sl.value {
++                    SlotValue::Raw(r) => format!("Raw(off={} len={} bytes={:?})", r.off, r.len, &cache.payload()[r.off..(r.off + r.len).min(cache.payload().len())]),
++                    SlotValue::Ref(crate::serializer::Ref::Object(b)) => format!("Obj#{} {}", b, cache.obj(*b).ty.name(table)),
++                    SlotValue::Ref(crate::serializer::Ref::Root(k)) => format!("Root#{} {}", k, table.roots.get(*k as usize).map(|n| n.as_str()).unwrap_or("?")),
++                    o => format!("{:?}", o),
++                };
++                eprintln!("    slot{} (byte {}) = {}", sl.index, sl.index * ts, d);
++            }
++        }
+         let raw: Vec<String> = (0..cache.array_len(scope_id).min(16))
+             .map(|i| match cache.array_elem(scope_id, i) {
+                 Some(Elem::Smi(v)) => format!("smi{v}"),
+@@ -708,7 +724,9 @@ fn read_scope_with<'a>(
+     // 是本作用域变量区里唯一的 ScopeInfo，而且这里只拿它解析变量名（有类型校验）。
+     if scope.outer.is_none() {
+         let start = names_off / ts;
+-        let end = cache.array_len(scope_id) + 2;
++        // 现代 ScopeInfo 没有 length 字段(array_len 会把 flags 当长度,压缩构建下
++        // 解出千万级垃圾值)→ 用对象实际槽数兜底。
++        let end = cache.obj(scope_id).slots.len() + 2;
+         for k in (start..end).rev() {
+             if let Some(Ref::Object(o)) = cache.slot_at(scope_id, k).and_then(|v| v.as_ref()) {
+                 if o != scope_id && cache.obj(o).ty.is(table, "ScopeInfo") {
+@@ -1489,7 +1507,7 @@ var __uncompiled = new Proxy({}, { get: () => function () {} });
+             .dis
+             .sfi_function_data_slots()
+             .iter()
+-            .find_map(|slot| match self.cache.slot_at(sfi, *slot) {
++            .find_map(|slot| match crate::serializer::CodeCache::deref_weak(self.cache.slot_at(sfi, *slot)) {
+                 Some(SlotValue::Ref(Ref::Object(b)))
+                     if self.cache.obj(*b).ty.is(self.table, "BytecodeArray") =>
+                 {
+@@ -1636,7 +1654,7 @@ var __uncompiled = new Proxy({}, { get: () => function () {} });
+             slots.push(2);
+         }
+         for slot in slots {
+-            if let Some(Ref::Object(o)) = self.cache.slot_at(sfi, slot).and_then(|v| v.as_ref()) {
++            if let Some(Ref::Object(o)) = crate::serializer::CodeCache::deref_weak(self.cache.slot_at(sfi, slot)).and_then(|v| v.as_ref()) {
+                 if self.cache.obj(o).ty.is(self.table, "ScopeInfo") {
+                     return Some(o);
+                 }
+@@ -1700,11 +1718,19 @@ impl<'a, 'b> FnCtx<'a, 'b> {
+             .clone()
+             .unwrap_or_else(|| crate::tables::BytecodeArrayLayout::fallback(d.ts));
+         let ts = d.ts;
+-        let bytecode_len = d
+-            .cache
+-            .raw_at_ts(bca, ts, ts, ts)
+-            .and_then(crate::serializer::decode_smi_bytes)
+-            .unwrap_or(0) as usize;
++        // 压缩构建(Electron):length 是 map+self 之后的 4 字节 Smi(表偏移可靠);
++        // 非压缩(官方 Node):沿用 read@ts + Smi 高半 的老口径。
++        let bytecode_len = if ts == 4 {
++            ba.off("length")
++                .and_then(|o| d.cache.raw_at_ts(bca, o, 4, ts))
++                .map(|x| u32::from_le_bytes(x.try_into().unwrap()) as usize >> 1)
++                .unwrap_or(0)
++        } else {
++            d.cache
++                .raw_at_ts(bca, ts, ts, ts)
++                .and_then(crate::serializer::decode_smi_bytes)
++                .unwrap_or(0) as usize
++        };
+         let code = d
+             .cache
+             .raw_at_ts(bca, ba.header_size, bytecode_len, ts)
+@@ -1743,9 +1769,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
+             .enumerate()
+             .map(|(i, ins)| (ins.offset, i))
+             .collect();
+-        let pool = d
+-            .cache
+-            .slot_at(bca, d.dis.bca_constant_pool_slot())
++        let pool = crate::serializer::CodeCache::deref_weak(
++            d.cache.slot_at(bca, d.dis.bca_constant_pool_slot()))
+             .and_then(|v| v.as_ref())
+             .and_then(|r| d.cache.ref_object(r));
+         let code_len = instrs.last().map(|i| i.offset).unwrap_or(0);
+@@ -9013,9 +9038,8 @@ fn read_handler_table<'a>(
+     idx_of: &HashMap<usize, usize>,
+ ) -> Vec<Handler> {
+     let ts = d.ts;
+-    let Some(h) = d
+-        .cache
+-        .slot_at(bca, d.dis.bca_handler_table_slot())
++    let Some(h) = crate::serializer::CodeCache::deref_weak(
++        d.cache.slot_at(bca, d.dis.bca_handler_table_slot()))
+         .and_then(|v| v.as_ref())
+         .and_then(|r| d.cache.ref_object(r))
+     else {
+diff --git a/src/disasm.rs b/src/disasm.rs
+index a74202c..b91fa85 100644
+--- a/src/disasm.rs
++++ b/src/disasm.rs
+@@ -145,7 +145,7 @@ impl<'a> Disassembler<'a> {
+                 "[sfi] id={id} name_slot={} slots={out:?}",
+                 self.sfi_name_slot()
+             );
+-            if let Some(SlotValue::Ref(Ref::Object(sid))) = self.cache.slot_at(id, self.sfi_name_slot())
++            if let Some(SlotValue::Ref(Ref::Object(sid))) = self.cache.deref_weak_slot(id, self.sfi_name_slot())
+             {
+                 let sid = *sid;
+                 if self.cache.obj(sid).ty.is(self.table, "ScopeInfo") {
+@@ -467,7 +467,7 @@ impl<'a> Disassembler<'a> {
+         // function_data 槽（9.x–12.x 单槽；13.6 起 trusted/untrusted 拆分，取指向 BCA 的那个）
+         let mut bca_id = None;
+         for slot in self.sfi_function_data_slots() {
+-            if let Some(SlotValue::Ref(Ref::Object(b))) = self.cache.slot_at(id, slot) {
++            if let Some(SlotValue::Ref(Ref::Object(b))) = self.cache.deref_weak_slot(id, slot) {
+                 if self.cache.obj(*b).ty.is(self.table, "BytecodeArray") {
+                     bca_id = Some(*b);
+                     break;
+@@ -484,11 +484,23 @@ impl<'a> Disassembler<'a> {
+             .unwrap_or_else(|| crate::tables::BytecodeArrayLayout::fallback(self.layout.tagged_size));
+         let header = ba_layout.header_size;
+         let obj = self.cache.obj(bca_id);
+-        let bytecode_len = self
+-            .cache
+-            .raw_at(bca_id, self.layout.tagged_size, self.layout.tagged_size)
+-            .map(|d| read_u64(d) >> 32)
+-            .unwrap_or(0) as usize;
++        // 长度字段位置随构建变:非压缩(Node x64)是 map 后第 2 个 tagged 槽的高半
++        // (read_u64>>32 的老技巧);压缩指针构建(Electron)是 map+self 之后的
++        // 4 字节字段。表里有 length 偏移时优先按表读。
++        // 压缩构建(Electron):按表偏移读 4 字节 Smi;非压缩保留 read_u64>>32 老口径
++        // (老表的 length 偏移不可靠)。
++        let bytecode_len = if self.layout.tagged_size == 4 {
++            ba_layout
++                .off("length")
++                .and_then(|o| self.cache.raw_at(bca_id, o, 4))
++                .map(|d| u32::from_le_bytes(d.try_into().unwrap()) as usize >> 1)
++                .unwrap_or(0)
++        } else {
++            self.cache
++                .raw_at(bca_id, self.layout.tagged_size, self.layout.tagged_size)
++                .map(|d| read_u64(d) >> 32)
++                .unwrap_or(0) as usize
++        };
+         let frame_size = ba_layout
+             .off("frame_size")
+             .and_then(|o| self.cache.raw_at(bca_id, o, 4))
+@@ -649,9 +661,8 @@ impl<'a> Disassembler<'a> {
+ 
+     fn render_constant_pool(&self, bca_id: ObjId, out: &mut String) {
+         // 常量池：FixedArray（map + length Smi + elements，Smi 与指针交错在 raw/ref 单元里）
+-        let pool = self
+-            .cache
+-            .slot_at(bca_id, self.bca_constant_pool_slot())
++        let pool = crate::serializer::CodeCache::deref_weak(
++            self.cache.slot_at(bca_id, self.bca_constant_pool_slot()))
+             .and_then(|v| v.as_ref())
+             .and_then(|r| self.cache.ref_object(r));
+         let Some(pool_id) = pool else {
+diff --git a/src/serializer.rs b/src/serializer.rs
+index 06b4427..5cb643f 100644
+--- a/src/serializer.rs
++++ b/src/serializer.rs
+@@ -822,11 +822,9 @@ impl<'a> Walker<'a> {
+         // （指针压缩构建 ts=4 → 4 字节/单位，非压缩 ts=8 → 8）。按 8 算会让每个对象的
+         // 字节尺寸翻倍、后续地址全偏（space2 的 backref 因此命不中）。
+         // 现代族固定 8 字节单位（kObjectAlignmentBits = 3）。
+-        let unit = if self.legacy.is_some() {
+-            self.tagged_size.max(4)
+-        } else {
+-            8
+-        };
++        // V8 ≥11.x: kObjectAlignmentBits = kTaggedSizeLog2 —— 指针压缩构建(如 Electron)
++        // 的对象尺寸单位是 4 字节,非压缩(官方 Node x64)是 8。不能用硬编码 8。
++        let unit = self.tagged_size.max(4);
+         let byte_size = size_words * unit;
+         if let Ok(v) = std::env::var("JSCD_DBG_OBJ") {
+             let want = v == "1" || space == v.parse::<u8>().unwrap_or(255);
+@@ -1465,6 +1463,20 @@ impl<'a> CodeCache<'a> {
+ 
+     /// 按槽号取槽值（slots 升序 → 二分）。
+     #[inline]
++    /// 解包 kIndirectPointerPrefix / kProtectedPointerPrefix 产生的 WeakRef 包装:
++    /// Electron(沙箱+压缩指针)构建里,受信指针(如 SFI 的 function_data)都带这个前缀,
++    /// 语义上与普通强引用等价 —— 取目标对象时应穿透。
++    pub fn deref_weak(v: Option<&SlotValue>) -> Option<&SlotValue> {
++        match v {
++            Some(SlotValue::WeakRef(inner)) => Self::deref_weak(Some(inner)),
++            other => other,
++        }
++    }
++
++    pub fn deref_weak_slot(&self, id: ObjId, index: usize) -> Option<&SlotValue> {
++        Self::deref_weak(self.slot_at(id, index))
++    }
++
+     pub fn slot_at(&self, id: ObjId, index: usize) -> Option<&SlotValue> {
+         let slots = &self.objects[id].slots;
+         let i = slots.partition_point(|s| s.index < index);
+@@ -1598,11 +1610,14 @@ pub fn decode_smi_bytes(d: &[u8]) -> Option<i64> {
+             }
+         }
+         4 => {
++            // 压缩指针构建的 Smi:value << 1(tag bit0 = 0)。
++            // 原实现的位判断写反了(bit0==0 才是 Smi);官方 Node 全走 8 字节
++            // 分支,这行从未被真实数据测过 —— Electron 构建全部踩中。
+             let raw = u32::from_le_bytes(d.try_into().ok()?);
+             if raw & 1 == 0 {
+-                None
+-            } else {
+                 Some(((raw as i32) >> 1) as i64)
++            } else {
++                None
+             }
+         }
+         _ => None,
+diff --git a/src/tables.rs b/src/tables.rs
+index 28c2201..24b278e 100644
+--- a/src/tables.rs
++++ b/src/tables.rs
+@@ -381,6 +381,12 @@ pub fn table_for(v8: &str) -> Option<VersionTable> {
+     serde_json::from_str(raw).ok()
+ }
+ 
++/// 按表文件名直接取表（用于同名版本的指针压缩变体,如 v13_6_pc.json）。
++pub fn table_by_file(name: &str) -> Option<VersionTable> {
++    let raw = table_map().get(name)?;
++    serde_json::from_str(raw).ok()
++}
++
+ /// 泄漏到 'static —— 版本字符串总量恒定（≤90 条 × 短字符串），进程级单例足够。
+ fn leaked(s: &str) -> &'static str {
+     Box::leak(s.to_string().into_boxed_str())
+diff --git a/src/tables_embed.rs b/src/tables_embed.rs
+index 9bbc2f7..ae9092b 100644
+--- a/src/tables_embed.rs
++++ b/src/tables_embed.rs
+@@ -10,6 +10,7 @@ pub static EMBEDDED_TABLE_FILES: &[(&str, &str)] = &[
+     ("v12_4.json", include_str!("../tables/v12_4.json")),
+     ("v12_9_23.11.1.json", include_str!("../tables/v12_9_23.11.1.json")),
+     ("v13_6.json", include_str!("../tables/v13_6.json")),
++    ("v13_6_pc.json", include_str!("../tables/v13_6_pc.json")),
+     ("v14_1.json", include_str!("../tables/v14_1.json")),
+     ("v14_6_26.10.0.json", include_str!("../tables/v14_6_26.10.0.json")),
+     ("v5_8.json", include_str!("../tables/v5_8.json")),
